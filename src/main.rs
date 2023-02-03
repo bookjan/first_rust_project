@@ -8,105 +8,135 @@ use juniper::{
 use juniper_graphql_ws::ConnectionConfig;
 use juniper_warp::{playground_filter, subscriptions::serve_graphql_ws};
 use warp::{http::Response, Filter};
-use tokio_postgres::{NoTls};
+use tokio_postgres::{Client, NoTls};
 
-#[derive(Clone)]
-struct Context;
+struct Context {
+    dbClient: Client,
+}
 
 impl juniper::Context for Context {}
 
-#[derive(Clone, Copy, GraphQLEnum)]
-enum UserKind {
-    Admin,
-    User,
-    Guest,
-}
-
-struct User {
-    id: i32,
-    kind: UserKind,
+#[derive(juniper::GraphQLObject)]
+struct Customer {
+    id: String,
     name: String,
-}
-
-// Field resolvers implementation
-#[graphql_object(context = Context)]
-impl User {
-    fn id(&self) -> i32 {
-        self.id
-    }
-
-    fn kind(&self) -> UserKind {
-        self.kind
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    async fn friends(&self) -> Vec<User> {
-        if self.id == 1 {
-            vec![
-                User {
-                    id: 11,
-                    kind: UserKind::User,
-                    name: "user11".into(),
-                },
-                User {
-                    id: 12,
-                    kind: UserKind::Admin,
-                    name: "user12".into(),
-                },
-                User {
-                    id: 13,
-                    kind: UserKind::Guest,
-                    name: "user13".into(),
-                },
-            ]
-        } else if self.id == 2 {
-            vec![User {
-                id: 21,
-                kind: UserKind::User,
-                name: "user21".into(),
-            }]
-        } else if self.id == 3 {
-            vec![
-                User {
-                    id: 31,
-                    kind: UserKind::User,
-                    name: "user31".into(),
-                },
-                User {
-                    id: 32,
-                    kind: UserKind::Guest,
-                    name: "user32".into(),
-                },
-            ]
-        } else {
-            vec![]
-        }
-    }
+    age: i32,
+    email: String,
+    address: String,
 }
 
 struct Query;
+struct Mutation;
+struct Subscription;
 
-#[graphql_object(context = Context)]
+#[graphql_object(Context = Context)]
 impl Query {
-    async fn users(id: i32) -> Vec<User> {
-        vec![User {
+    async fn customer(ctx: &Context, id: String) -> juniper::FieldResult<Customer> {
+        let uuid = uuid::Uuid::parse_str(&id)?;
+        let row = ctx
+            .dbClient
+            .query_one(
+                "SELECT name, age, email, address FROM customers WHERE id = $1",
+                &[&uuid],
+            )
+            .await?;
+        let customer = Customer {
             id,
-            kind: UserKind::Admin,
-            name: "User Name".into(),
-        }]
+            name: row.try_get(0)?,
+            age: row.try_get(1)?,
+            email: row.try_get(2)?,
+            address: row.try_get(3)?,
+        };
+        Ok(customer)
+    }
+
+    async fn customers(ctx: &Context) -> juniper::FieldResult<Vec<Customer>> {
+        let rows = ctx
+            .dbClient
+            .query("SELECT id, name, age, email, address FROM customers", &[])
+            .await?;
+        let mut customers = Vec::new();
+        for row in rows {
+            let id: uuid::Uuid = row.try_get(0)?;
+            let customer = Customer {
+                id: id.to_string(),
+                name: row.try_get(1)?,
+                age: row.try_get(2)?,
+                email: row.try_get(3)?,
+                address: row.try_get(4)?,
+            };
+            customers.push(customer);
+        }
+        Ok(customers)
     }
 }
 
-type UsersStream = Pin<Box<dyn Stream<Item = Result<User, FieldError>> + Send>>;
+#[graphql_object(Context = Context)]
+impl Mutation {
+    async fn register_customer(
+        ctx: &Context,
+        name: String,
+        age: i32,
+        email: String,
+        address: String,
+    ) -> juniper::FieldResult<Customer> {
+        let id = uuid::Uuid::new_v4();
+        let email = email.to_lowercase();
+        ctx.dbClient
+            .execute(
+                "INSERT INTO customers (id, name, age, email, address) VALUES ($1, $2, $3, $4, $5)",
+                &[&id, &name, &age.to_string(), &email, &address],
+            )
+            .await?;
+        Ok(Customer {
+            id: id.to_string(),
+            name,
+            age,
+            email,
+            address,
+        })
+    }
 
-struct Subscription;
+    async fn update_customer_email(
+        ctx: &Context,
+        id: String,
+        email: String,
+    ) -> juniper::FieldResult<String> {
+        let uuid = uuid::Uuid::parse_str(&id)?;
+        let email = email.to_lowercase();
+        let n = ctx
+            .client
+            .execute(
+                "UPDATE customers SET email = $1 WHERE id = $2",
+                &[&email, &uuid],
+            )
+            .await?;
+        if n == 0 {
+            return Err("User does not exist".into());
+        }
+        Ok(email)
+    }
+
+    async fn delete_customer(ctx: &Context, id: String) -> juniper::FieldResult<bool> {
+        let uuid = uuid::Uuid::parse_str(&id)?;
+        let n = ctx
+            .dbClient
+            .execute("DELETE FROM customers WHERE id = $1", &[&uuid])
+            .await?;
+        if n == 0 {
+            return Err("User does not exist".into());
+        }
+        Ok(true)
+    }
+}
+
+type CustomerStream = Pin<Box<dyn Stream<Item = Result<Customer, FieldError>> + Send>>;
+
+
 
 #[graphql_subscription(context = Context)]
 impl Subscription {
-    async fn users() -> UsersStream {
+    async fn customers() -> CustomerStream {
         let mut counter = 0;
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         let stream = async_stream::stream! {
@@ -119,10 +149,12 @@ impl Subscription {
                         graphql_value!("some additional string"),
                     ))
                 } else {
-                    yield Ok(User {
-                        id: counter,
-                        kind: UserKind::Admin,
-                        name: "stream user".into(),
+                    yield Ok(Customer {
+                        id: counter.to_string(),
+                        name: counter.to_string(),
+                        age: counter,
+                        email: counter.to_string(),
+                        address: counter.to_string(),
                     })
                 }
             }
