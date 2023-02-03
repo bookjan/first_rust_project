@@ -8,6 +8,7 @@ use juniper::{
 use juniper_graphql_ws::ConnectionConfig;
 use juniper_warp::{playground_filter, subscriptions::serve_graphql_ws};
 use warp::{http::Response, Filter};
+use tokio_postgres::{NoTls};
 
 #[derive(Clone)]
 struct Context;
@@ -143,6 +144,30 @@ async fn main() {
     env_logger::init();
 
     let log = warp::log("warp_subscriptions");
+
+    let (client, connection) = tokio_postgres::connect("host=localhost user=postgres password='postgres'", NoTls)
+    .await
+    .unwrap();
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {}", e);
+        }
+    });
+
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS customers(
+            id UUID PRIMARY KEY,
+            name TEXT NOT NULL,
+            age INT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            address TEXT NOT NULL
+        )",
+            &[],
+        )
+        .await
+        .expect("Could not create table");
 
     let homepage = warp::path::end().map(|| {
         Response::builder()
