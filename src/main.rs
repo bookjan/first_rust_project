@@ -1,17 +1,15 @@
-use std::{env, pin::Pin, sync::Arc, time::Duration};
-
-use futures::{FutureExt as _, Stream};
-use juniper::{
-    graphql_object, graphql_subscription, graphql_value, EmptyMutation, FieldError, GraphQLEnum,
-    RootNode,
-};
-use juniper_graphql_ws::ConnectionConfig;
-use juniper_warp::{playground_filter, subscriptions::serve_graphql_ws};
-use warp::{http::Response, Filter};
+use juniper::{graphql_object, EmptySubscription, RootNode};
+use std::sync::Arc;
 use tokio_postgres::{Client, NoTls};
+use warp::{http::Response, Filter};
+
+#[derive(Debug)]
+struct AppState {
+    client: Client,
+}
 
 struct Context {
-    dbClient: Client,
+    app_state: Arc<AppState>,
 }
 
 impl juniper::Context for Context {}
@@ -27,14 +25,14 @@ struct Customer {
 
 struct Query;
 struct Mutation;
-struct Subscription;
 
 #[graphql_object(Context = Context)]
 impl Query {
     async fn customer(ctx: &Context, id: String) -> juniper::FieldResult<Customer> {
         let uuid = uuid::Uuid::parse_str(&id)?;
         let row = ctx
-            .dbClient
+            .app_state
+            .client
             .query_one(
                 "SELECT name, age, email, address FROM customers WHERE id = $1",
                 &[&uuid],
@@ -52,7 +50,8 @@ impl Query {
 
     async fn customers(ctx: &Context) -> juniper::FieldResult<Vec<Customer>> {
         let rows = ctx
-            .dbClient
+            .app_state
+            .client
             .query("SELECT id, name, age, email, address FROM customers", &[])
             .await?;
         let mut customers = Vec::new();
@@ -82,10 +81,11 @@ impl Mutation {
     ) -> juniper::FieldResult<Customer> {
         let id = uuid::Uuid::new_v4();
         let email = email.to_lowercase();
-        ctx.dbClient
+        ctx.app_state
+            .client
             .execute(
                 "INSERT INTO customers (id, name, age, email, address) VALUES ($1, $2, $3, $4, $5)",
-                &[&id, &name, &age.to_string(), &email, &address],
+                &[&id, &name, &age, &email, &address],
             )
             .await?;
         Ok(Customer {
@@ -105,6 +105,7 @@ impl Mutation {
         let uuid = uuid::Uuid::parse_str(&id)?;
         let email = email.to_lowercase();
         let n = ctx
+            .app_state
             .client
             .execute(
                 "UPDATE customers SET email = $1 WHERE id = $2",
@@ -120,7 +121,8 @@ impl Mutation {
     async fn delete_customer(ctx: &Context, id: String) -> juniper::FieldResult<bool> {
         let uuid = uuid::Uuid::parse_str(&id)?;
         let n = ctx
-            .dbClient
+            .app_state
+            .client
             .execute("DELETE FROM customers WHERE id = $1", &[&uuid])
             .await?;
         if n == 0 {
@@ -130,56 +132,27 @@ impl Mutation {
     }
 }
 
-type CustomerStream = Pin<Box<dyn Stream<Item = Result<Customer, FieldError>> + Send>>;
-
-
-
-#[graphql_subscription(context = Context)]
-impl Subscription {
-    async fn customers() -> CustomerStream {
-        let mut counter = 0;
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-        let stream = async_stream::stream! {
-            counter += 1;
-            loop {
-                interval.tick().await;
-                if counter == 2 {
-                    yield Err(FieldError::new(
-                        "some field error from handler",
-                        graphql_value!("some additional string"),
-                    ))
-                } else {
-                    yield Ok(Customer {
-                        id: counter.to_string(),
-                        name: counter.to_string(),
-                        age: counter,
-                        email: counter.to_string(),
-                        address: counter.to_string(),
-                    })
-                }
-            }
-        };
-
-        Box::pin(stream)
-    }
-}
-
-type Schema = RootNode<'static, Query, EmptyMutation<Context>, Subscription>;
+type Schema = RootNode<'static, Query, Mutation, EmptySubscription<Context>>;
 
 fn schema() -> Schema {
-    Schema::new(Query, EmptyMutation::new(), Subscription)
+    Schema::new(
+        Query,
+        Mutation,
+        EmptySubscription::<Context>::new(),
+    )
 }
 
 #[tokio::main]
 async fn main() {
-    env::set_var("RUST_LOG", "warp_subscriptions");
+    std::env::set_var("RUST_LOG", "warp_async");
     env_logger::init();
 
-    let log = warp::log("warp_subscriptions");
+    let log = warp::log("warp_server");
 
-    let (client, connection) = tokio_postgres::connect("host=localhost user=postgres password='postgres'", NoTls)
-    .await
-    .unwrap();
+    let (client, connection) =
+        tokio_postgres::connect("host=localhost user=postgres password='postgres'", NoTls)
+            .await
+            .unwrap();
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -204,43 +177,31 @@ async fn main() {
     let homepage = warp::path::end().map(|| {
         Response::builder()
             .header("content-type", "text/html")
-            .body("<html><h1>juniper_subscriptions demo</h1><div>visit <a href=\"/playground\">graphql playground</a></html>")
+            .body(
+                "<html><h1>juniper_warp</h1><div>visit <a href=\"/graphiql\">/graphiql</a></html>",
+            )
     });
-
-    let qm_schema = schema();
-    let qm_state = warp::any().map(|| Context);
-    let qm_graphql_filter = juniper_warp::make_graphql_filter(qm_schema, qm_state.boxed());
-
-    let root_node = Arc::new(schema());
 
     log::info!("Listening on 127.0.0.1:8080");
 
-    let routes = (warp::path("subscriptions")
-        .and(warp::ws())
-        .map(move |ws: warp::ws::Ws| {
-            let root_node = root_node.clone();
-            ws.on_upgrade(move |websocket| async move {
-                serve_graphql_ws(websocket, root_node, ConnectionConfig::new(Context))
-                    .map(|r| {
-                        if let Err(e) = r {
-                            println!("Websocket error: {e}");
-                        }
-                    })
-                    .await
-            })
-        }))
-    .map(|reply| {
-        // TODO#584: remove this workaround
-        warp::reply::with_header(reply, "Sec-WebSocket-Protocol", "graphql-ws")
-    })
-    .or(warp::post()
-        .and(warp::path("graphql"))
-        .and(qm_graphql_filter))
-    .or(warp::get()
-        .and(warp::path("playground"))
-        .and(playground_filter("/graphql", Some("/subscriptions"))))
-    .or(homepage)
-    .with(log);
+    let app_state = Arc::new(AppState { client: client });
+    let app_state = warp::any().map(move || app_state.clone());
 
-    warp::serve(routes).run(([127, 0, 0, 1], 8080)).await;
+    let state = warp::any()
+        .and(app_state)
+        .map(|app_state: Arc<AppState>| Context {
+            app_state: app_state,
+        });
+    let graphql_filter = juniper_warp::make_graphql_filter(schema(), state.boxed());
+
+    warp::serve(
+        warp::get()
+            .and(warp::path("graphiql"))
+            .and(juniper_warp::graphiql_filter("/graphql", None))
+            .or(homepage)
+            .or(warp::path("graphql").and(graphql_filter))
+            .with(log),
+    )
+    .run(([127, 0, 0, 1], 8080))
+    .await
 }
